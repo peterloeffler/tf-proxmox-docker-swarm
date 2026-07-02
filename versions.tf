@@ -6,5 +6,8 @@ terraform {
     ssh = {
       source = "loafoe/ssh"
     }
+    docker = {
+      source  = "kreuzwerker/docker"
+    }
   } 
 }
