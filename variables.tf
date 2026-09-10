@@ -1,7 +1,7 @@
-variable "proxmox_node" {
-  type        = string
-  description = "The name of the Proxmox node where resources will be created"
-  default     = "px1"
+variable "proxmox_nodes" {
+  type        = list(string)
+  description = "The names of the Proxmox cluster nodes, used for even swarm VM placement"
+  default     = ["pve01-001", "pve01-002", "pve01-003"]
 }
 
 variable "ssh_public_key" {

@@ -1,22 +1,26 @@
 resource "proxmox_virtual_environment_file" "lightwhale_iso" {
-  node_name    = var.proxmox_node
+  node_name    = var.proxmox_nodes[0]
   content_type = "iso"
-  datastore_id = "local"
+  datastore_id = "cephfs"
 
   source_file {
-    path      = "https://lightwhale.asklandd.dk/download/lightwhale-3.0.4-x86.iso"
+    path = "https://lightwhale.asklandd.dk/download/lightwhale-3.0.5-x86.iso"
   }
 }
 
 #################################################################################################################################################################
 
 resource "proxmox_virtual_environment_vm" "core" {
-  node_name = var.proxmox_node
+  node_name = var.proxmox_nodes[0]
   name      = "core"
   started   = true
 
   machine = "q35"
   bios    = "seabios"
+
+  lifecycle {
+    ignore_changes = [node_name]
+  }
 
   cpu {
     type  = "host"
@@ -87,16 +91,16 @@ resource "ssh_resource" "core_config" {
     vm_id = proxmox_virtual_environment_vm.core.id
   }
 
-  host        = local.core_ip
-  user        = "op"
-  password    = "opsecret"
+  host     = local.core_ip
+  user     = "op"
+  password = "opsecret"
 
   commands = [
     "rm -f /home/op/.telemetry-nudge",
     "echo '${var.ssh_public_key}' > /home/op/.ssh/authorized_keys",
     "echo 'opsecret' | sudo -S bash -c 'setup-hostname ${proxmox_virtual_environment_vm.core.name}'",
     "echo 'opsecret' | sudo -S bash -c 'echo \"op ALL=(ALL:ALL) NOPASSWD: ALL\" > /etc/sudoers.d/op_nopasswd'",
-    "echo 'opsecret' | sudo -S bash -c \"sed -i 's/^\\(op:\\)[^:]*:/\\1*:/g' /etc/shadow\"",
+    #"echo 'opsecret' | sudo -S bash -c \"sed -i 's/^\\(op:\\)[^:]*:/\\1*:/g' /etc/shadow\"",
     "echo 'opsecret' | sudo -S bash -c 'reboot'",
   ]
 
@@ -118,12 +122,16 @@ resource "time_sleep" "core_config_wait" {
 resource "proxmox_virtual_environment_vm" "swarm" {
   count = 3
 
-  node_name = var.proxmox_node
+  node_name = var.proxmox_nodes[count.index]
   name      = "swarm${count.index + 1}"
   started   = true
 
   machine = "q35"
   bios    = "seabios"
+
+  lifecycle {
+    ignore_changes = [node_name]
+  }
 
   cpu {
     type  = "host"
@@ -148,7 +156,7 @@ resource "proxmox_virtual_environment_vm" "swarm" {
   }
 
   disk {
-    datastore_id = "local-lvm"
+    datastore_id = "ceph-vm"
     interface    = "scsi0"
     size         = 20
     file_format  = "raw"
@@ -156,6 +164,34 @@ resource "proxmox_virtual_environment_vm" "swarm" {
 
   scsi_hardware = "virtio-scsi-pci"
   boot_order    = ["ide2"]
+}
+
+resource "proxmox_haresource" "swarm" {
+  count = 3
+
+  resource_id = "vm:${proxmox_virtual_environment_vm.swarm[count.index].vm_id}"
+  state       = "started"
+  failback    = true
+
+  depends_on = [
+    proxmox_virtual_environment_vm.swarm,
+  ]
+}
+
+resource "proxmox_harule" "swarm" {
+  for_each = { for idx, node in var.proxmox_nodes : idx => node }
+
+  rule   = "swarm${each.key + 1}-home"
+  type   = "node-affinity"
+  strict = true
+
+  nodes = { for node in var.proxmox_nodes : node => (node == each.value ? 1 : null) }
+
+  resources = [proxmox_haresource.swarm[each.key].resource_id]
+
+  depends_on = [
+    proxmox_haresource.swarm,
+  ]
 }
 
 ##### LOCALS for IPs!!!!!!
@@ -205,7 +241,7 @@ resource "ssh_resource" "swarm_config" {
     "echo '${var.ssh_public_key}' > /home/op/.ssh/authorized_keys",
     "echo 'opsecret' | sudo -S bash -c 'setup-hostname ${proxmox_virtual_environment_vm.swarm[count.index].name}'",
     "echo 'opsecret' | sudo -S bash -c 'echo \"op ALL=(ALL:ALL) NOPASSWD: ALL\" > /etc/sudoers.d/op_nopasswd'",
-    "echo 'opsecret' | sudo -S bash -c \"sed -i 's/^\\(op:\\)[^:]*:/\\1*:/g' /etc/shadow\"",
+    #"echo 'opsecret' | sudo -S bash -c \"sed -i 's/^\\(op:\\)[^:]*:/\\1*:/g' /etc/shadow\"",
     "echo 'opsecret' | sudo -S bash -c 'reboot'",
   ]
 
@@ -255,7 +291,7 @@ resource "ssh_resource" "swarm_join" {
 #################################################################################################################################################################
 
 provider "docker" {
-  host     = "ssh://op@${local.core_ip}:22"
+  host = "ssh://op@${local.core_ip}:22"
 }
 
 resource "docker_compose" "komodo" {
