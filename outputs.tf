@@ -1,8 +1,3 @@
-#output "core_ip" {
-#  description = "Core VM IP"
-#  value       = local.core_ip
-#}
-
 output "swarm_ips" {
   description = "Swarm VM IPs"
 

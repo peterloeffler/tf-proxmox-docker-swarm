@@ -24,13 +24,32 @@ resource "proxmox_virtual_environment_file" "lightwhale_magic" {
   }
 }
 
+# Prepare CephFS for this swarm on a Proxmox host, where CephFS is already
+# mounted. Creates the swarm's own subdirectory and a CephFS client restricted
+# to it, then returns that client's key - which is the mount secret, so it never
+# has to be passed in. `ceph fs authorize` returns the existing key unchanged if
+# the client already exists.
+resource "ssh_sensitive_resource" "cephfs_client" {
+  host  = local.cephfs_first_host
+  user  = var.proxmox_ssh_user
+  agent = true
+
+  triggers = {
+    path = "${var.cephfs_root_dir}/${var.swarm_name}"
+  }
+
+  commands = [
+    "mkdir -p ${local.cephfs_pve_path} && chmod 777 ${local.cephfs_pve_path} && ceph fs authorize cephfs client.${var.swarm_name} ${var.cephfs_root_dir}/${var.swarm_name} rw > /dev/null 2>&1 && ceph auth get-key client.${var.swarm_name}",
+  ]
+}
+
 #################################################################################################################################################################
 
 resource "proxmox_virtual_environment_vm" "swarm" {
   count = 3
 
   node_name = var.proxmox_nodes[count.index]
-  name      = "${var.swarm_name}-00${count.index + 1}"
+  name      = format("%s-%03d", var.swarm_name, count.index + 1)
   started   = true
 
   machine = "q35"
@@ -83,6 +102,21 @@ locals {
     for vm in proxmox_virtual_environment_vm.swarm :
     flatten(vm.ipv4_addresses)[index(vm.network_interface_names, "eth0")]
   ]
+
+  # The swarm gets its own CephFS subdirectory, and authenticates as a client
+  # named after the swarm, so several swarms can share one CephFS.
+  cephfs_source = "${var.cephfs_hosts}:${var.cephfs_root_dir}/${var.swarm_name}"
+
+  # _netdev is what makes lightwhale's S41mount wait for the network and run
+  # before S60dockerd, so the mount is back on its own after a reboot.
+  cephfs_fstab_entry = "${local.cephfs_source} ${var.cephfs_target} ceph name=${var.swarm_name},secret=${local.cephfs_secret},_netdev,noatime 0 0"
+
+  # Only the first monitor is used to prepare CephFS, without its port. It is a
+  # Proxmox host, which mounts CephFS under /mnt/pve/<datastore>.
+  cephfs_first_host = split(":", split(",", var.cephfs_hosts)[0])[0]
+  cephfs_pve_path   = "/mnt/pve/cephfs${var.cephfs_root_dir}/${var.swarm_name}"
+
+  cephfs_secret = trimspace(ssh_sensitive_resource.cephfs_client.result)
 }
 
 resource "proxmox_haresource" "swarm" {
@@ -100,7 +134,7 @@ resource "proxmox_haresource" "swarm" {
 resource "proxmox_harule" "swarm" {
   for_each = { for idx, node in var.proxmox_nodes : idx => node }
 
-  rule   = "${var.swarm_name}-00${each.key + 1}-home"
+  rule   = format("%s-%03d-home", var.swarm_name, tonumber(each.key) + 1)
   type   = "node-affinity"
   strict = true
 
@@ -141,13 +175,13 @@ resource "ssh_resource" "swarm_config" {
     # CephFS goes into /etc/fstab: lightwhale's S41mount creates the mountpoint,
     # waits for the network because of _netdev and runs before S60dockerd, so the
     # mount is back on its own after a reboot.
-    "echo 'opsecret' | sudo -S sh -c \"grep -q ' /mnt/cephfs ' /etc/fstab || printf '%s\\n' '${var.cephfs_fstab_entry}' >> /etc/fstab\"",
-    "echo 'opsecret' | sudo -S bash -c 'mkdir -p /mnt/cephfs && mount /mnt/cephfs'",
-    "echo 'opsecret' | sudo -S bash -c \"sed -i 's/^\\(op:\\)[^:]*:/\\1*:/g' /etc/shadow\"",
+    "echo 'opsecret' | sudo -S sh -c \"grep -q ' ${var.cephfs_target} ' /etc/fstab || printf '%s\\n' '${local.cephfs_fstab_entry}' >> /etc/fstab\"",
+    "echo 'opsecret' | sudo -S bash -c 'mkdir -p ${var.cephfs_target} && mount ${var.cephfs_target}'",
   ]
 
   depends_on = [
     proxmox_virtual_environment_vm.swarm,
+    ssh_sensitive_resource.cephfs_client,
   ]
 }
 
@@ -196,33 +230,57 @@ resource "ssh_resource" "komodo_deploy" {
   # Runs before the file uploads, so the target directory exists and is writable.
   # All komodo state lives on CephFS, the lightwhale nodes stay stateless.
   pre_commands = [
-    "sudo mkdir -p /mnt/cephfs/komodo/mongo/data /mnt/cephfs/komodo/mongo/config /mnt/cephfs/komodo/keys /mnt/cephfs/komodo/backups",
+    "sudo mkdir -p ${var.cephfs_target}/komodo/mongo/data ${var.cephfs_target}/komodo/mongo/config ${var.cephfs_target}/komodo/keys ${var.cephfs_target}/komodo/backups",
     # Swarm never creates bind mount sources, so the per-node periphery roots
     # have to exist before the tasks are scheduled.
-    "sudo mkdir -p ${join(" ", [for vm in proxmox_virtual_environment_vm.swarm : "/mnt/cephfs/komodo/periphery/${vm.name}"])}",
-    "sudo chown -R op:op /mnt/cephfs/komodo",
-    "sudo chown -R 999:999 /mnt/cephfs/komodo/mongo",
+    "sudo mkdir -p ${join(" ", [for vm in proxmox_virtual_environment_vm.swarm : "${var.cephfs_target}/komodo/periphery/${vm.name}"])}",
+    "sudo chown -R op:op ${var.cephfs_target}/komodo",
+    "sudo chown -R 999:999 ${var.cephfs_target}/komodo/mongo",
   ]
 
   file {
     content     = file("${path.module}/docker-compose/komodo/komodo.compose.yaml")
-    destination = "/mnt/cephfs/komodo/komodo.compose.yaml"
+    destination = "${var.cephfs_target}/komodo/komodo.compose.yaml"
     permissions = "0644"
   }
 
   file {
     content     = file("${path.module}/docker-compose/komodo/compose.env")
-    destination = "/mnt/cephfs/komodo/compose.env"
+    destination = "${var.cephfs_target}/komodo/compose.env"
     permissions = "0600"
   }
 
   # docker stack deploy only substitutes ${...} from the shell environment,
   # env_file is resolved separately and does not feed the interpolation.
   commands = [
-    "set -a && . /mnt/cephfs/komodo/compose.env && set +a && docker stack deploy -d -c /mnt/cephfs/komodo/komodo.compose.yaml komodo",
+    "set -a && . ${var.cephfs_target}/komodo/compose.env && set +a && docker stack deploy -d -c ${var.cephfs_target}/komodo/komodo.compose.yaml komodo",
   ]
 
   depends_on = [
     ssh_resource.swarm_join,
+  ]
+}
+
+#################################################################################################################################################################
+
+# Runs last and over the key that swarm_config installed, because it takes away
+# the password login that swarm_config itself needs.
+resource "ssh_resource" "swarm_lock_password" {
+  count = 3
+
+  triggers = {
+    vm_id = proxmox_virtual_environment_vm.swarm[count.index].id
+  }
+
+  host  = local.swarm_ips[count.index]
+  user  = "op"
+  agent = true
+
+  commands = [
+    "sudo sh -c \"sed -i 's/^\\(op:\\)[^:]*:/\\1*:/g' /etc/shadow\"",
+  ]
+
+  depends_on = [
+    ssh_resource.komodo_deploy,
   ]
 }
