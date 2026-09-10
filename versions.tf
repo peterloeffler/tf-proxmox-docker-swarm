@@ -8,10 +8,6 @@ terraform {
       source  = "loafoe/ssh"
       version = "~> 2.7.0"
     }
-    docker = {
-      source  = "kreuzwerker/docker"
-      version = "~> 4.6.0"
-    }
     time = {
       source  = "hashicorp/time"
       version = "~> 0.14.1"
